@@ -52,10 +52,15 @@ def from_scaled(value: int) -> Decimal:
         return Decimal(value) / SCALE
 
 
-def connect(path: str | Path = ":memory:") -> sqlite3.Connection:
+def connect(path: str | Path = ":memory:", *, read_only: bool = False) -> sqlite3.Connection:
     if sqlite3.sqlite_version_info < (3, 37, 0):
         raise RuntimeError("SQLite 3.37+ is required for STRICT tables")
-    connection = sqlite3.connect(str(path))
+    if read_only:
+        if str(path) == ":memory:":
+            raise ValueError("read_only requires an existing file database")
+        connection = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+    else:
+        connection = sqlite3.connect(str(path))
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
