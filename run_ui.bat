@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-python -m pip install -e ".[ui]"
+python -m pip install -e ".[ui,ocr]"
 if errorlevel 1 (
     echo Installation failed. Check Python 3.11+ and your internet connection.
     pause

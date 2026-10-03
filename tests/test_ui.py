@@ -85,6 +85,20 @@ class FormTests(unittest.TestCase):
         self.assertFalse(self.app.exception)
         self.assertTrue(any("거래가 없습니다" in i.value for i in self.app.info))
 
+    def test_local_ocr_page_renders_without_sending_data_to_an_ocr_service(self):
+        self.create_account()
+        self.app.radio(key="page").set_value("사진 거래 가져오기").run()
+        self.assertFalse(self.app.exception)
+        self.assertTrue(any(i.label == "토스뱅크 거래 화면 이미지" for i in self.app.file_uploader))
+        self.assertTrue(any("기기에서만 읽습니다" in c.value for c in self.app.caption))
+
+    def test_diagnostics_page_shows_scope_and_empty_year_to_date_message(self):
+        self.create_account()
+        self.app.radio(key="page").set_value("자금 진단").run()
+        self.assertFalse(self.app.exception)
+        self.assertTrue(any("순자산이나 가처분소득이 아닙니다" in c.value for c in self.app.caption))
+        self.assertTrue(any("등록된 입출금·이체 거래가 없습니다" in i.value for i in self.app.info))
+
     def test_sale_and_later_tax_completion_calculates(self):
         self.create_holding()
         self.app.radio(key="page").set_value("거래·과세자료").run()

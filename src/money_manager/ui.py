@@ -1,6 +1,7 @@
 """Local Korean input forms over the existing schema and step-2 engine."""
 import os
 import sqlite3
+import hashlib
 from datetime import date, datetime
 from decimal import Decimal, localcontext
 from pathlib import Path
@@ -9,10 +10,12 @@ from zoneinfo import ZoneInfo
 import streamlit as st
 
 from .db import connect, get, initialize, insert
+from .diagnostics import portfolio_diagnostics
 from .input_service import (
     all_models, decimal_input, friendly_error, save_account, save_cash, save_holding,
     save_transaction, won_input,
 )
+from .local_ocr import extract_local_text, parse_candidates
 from .models import Account, CashBalance, Holding, Instrument, TaxEvent, Taxpayer, TaxPolicy, Transaction
 from .tax_engine import AnnualTaxRequest, ISAContractRequest, TaxEngine
 
@@ -162,6 +165,105 @@ def cash_page(db, accounts):
     balances = [c for c in all_models(db, CashBalance, "cash_balances") if c.account_id == account.id]
     if balances:
         st.dataframe([{"통화": c.currency.value, "잔액": str(c.amount), "환율": str(c.fx)} for c in balances], hide_index=True)
+
+
+def ocr_import_page(db, accounts):
+    st.subheader("6. 사진에서 거래 가져오기")
+    st.caption("로컬 Tesseract로 이 기기에서만 읽습니다. 사진·OCR 원문은 DB에 저장하지 않으며, 확인한 거래만 저장합니다.")
+    account = choose_account(accounts, "ocr_account")
+    uploaded = st.file_uploader("토스뱅크 거래 화면 이미지", type=["png", "jpg", "jpeg"], key="ocr_upload")
+    if uploaded is None:
+        st.info("거래 한 건이 보이는 화면을 이미지로 올리세요. 계좌번호 등 불필요한 개인정보는 가린 뒤 올리는 것을 권장합니다.")
+        return
+
+    image_bytes = uploaded.getvalue()
+    if len(image_bytes) > 15 * 1024 * 1024:
+        st.error("이미지 크기는 15MB 이하여야 합니다.")
+        return
+    image_hash = hashlib.sha256(image_bytes).hexdigest()
+    if st.session_state.get("ocr_image_hash") != image_hash:
+        st.session_state["ocr_image_hash"] = image_hash
+        st.session_state.pop("ocr_text", None)
+    if st.button("기기에서 OCR 실행", type="primary", key="run_local_ocr"):
+        try:
+            st.session_state["ocr_text"] = extract_local_text(image_bytes)
+        except (RuntimeError, ValueError) as exc:
+            st.error(str(exc))
+            return
+
+    text = st.session_state.get("ocr_text")
+    if text is None:
+        st.info("OCR을 실행하면 읽은 내용을 확인하고 거래 저장 후보를 만들 수 있습니다.")
+        return
+    if not text.strip():
+        st.warning("글자를 읽지 못했습니다. 선명한 이미지를 다시 올리거나 직접 입력을 사용하세요.")
+        return
+
+    candidates = parse_candidates(text)
+    candidate = None
+    key_suffix = image_hash[:12]
+    st.text_area("인식 결과 (기기에 임시 표시)", value=text, height=150, disabled=True,
+                 key=f"ocr_preview_{key_suffix}")
+    if candidates:
+        candidate = st.selectbox(
+            "거래 행 선택",
+            [None, *candidates],
+            format_func=lambda item: "직접 확인 후 입력" if item is None else item.line,
+            key=f"ocr_row_{key_suffix}",
+        )
+    st.caption("자동 인식은 후보 입력일 뿐입니다. 날짜·금액·입출금 종류를 원본과 대조한 뒤 저장하세요.")
+    with st.form(f"ocr_transaction_form_{key_suffix}"):
+        kind = st.selectbox("거래 종류", ["입금", "출금"], key=f"ocr_kind_{key_suffix}")
+        candidate_date = candidate.recognized_on if candidate and candidate.recognized_on else now().date()
+        recognized = st.date_input("거래일 / 인식일", value=candidate_date, key=f"ocr_date_{key_suffix}")
+        suggested_amount = str(abs(candidate.amount_krw)) if candidate and candidate.amount_krw is not None else ""
+        amount_text = st.text_input("거래 금액 (원)", value=suggested_amount, key=f"ocr_amount_{key_suffix}")
+        seed = f"{image_hash}:{candidate.line if candidate else 'manual'}"
+        default_ref = "ocr-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+        reference = st.text_input("중복 확인용 거래번호", value=default_ref, key=f"ocr_ref_{key_suffix}")
+        if st.form_submit_button("확인한 거래 저장", type="primary"):
+            def save():
+                transaction = Transaction(
+                    account_id=account.id, external_ref=reference,
+                    transaction_type="DEPOSIT" if kind == "입금" else "WITHDRAWAL",
+                    traded_on=recognized, recognized_on=recognized, currency="KRW",
+                    gross_amount=decimal_input(amount_text, "거래 금액"), fx="1",
+                )
+                save_transaction(db, transaction)
+            feedback(save)
+
+
+def diagnostics_page(db, owner):
+    st.subheader("7. 자금 현황 진단")
+    today = now().date()
+    year = st.number_input("분석 연도", value=today.year, min_value=1900, max_value=9998, step=1, key="diagnostic_year")
+    result = portfolio_diagnostics(db, owner.id, int(year), today)
+    st.caption("등록된 스냅샷과 거래만 요약합니다. 대출·카드 부채, 누락된 계좌·거래는 반영되지 않아 순자산이나 가처분소득이 아닙니다.")
+    first, second, third = st.columns(3)
+    first.metric("입력자료 기준 알려진 자산", f"{result['known_snapshot_value_krw']:,}원")
+    second.metric("현재가 입력 보유종목", f"{result['priced_holdings_count']}개",
+                  help=f"현재가 미입력 종목 {result['unpriced_holdings_count']}개는 평가액에서 제외했습니다.")
+    third.metric("현금 스냅샷 환산액", f"{result['cash_value_krw']:,}원")
+    st.caption(f"보유종목 평가액 {result['holdings_value_krw']:,}원 + 현금 {result['cash_value_krw']:,}원입니다. 현재가·환율은 사용자가 입력한 값입니다.")
+    if result["unpriced_holdings_count"]:
+        st.warning(f"현재가가 없는 보유종목 {result['unpriced_holdings_count']}개는 알려진 자산 합계에 포함되지 않았습니다.")
+
+    st.markdown(f"**{year}년 등록된 입출금·이체 흐름 (연초~오늘)**")
+    st.caption("투자계좌 간 이체도 포함될 수 있으므로 수입·생활비 지출로 간주하지 않습니다.")
+    if result["monthly_flows"]:
+        st.dataframe(result["monthly_flows"], hide_index=True, width="stretch")
+    else:
+        st.info("분석 기간에 등록된 입출금·이체 거래가 없습니다.")
+
+    st.markdown("**세무자료 누락 점검**")
+    total = result["tax_income_transaction_count"]
+    incomplete = result["incomplete_tax_event_count"]
+    if incomplete:
+        st.warning(f"매도·배당·이자 {total}건 중 {incomplete}건에 과세자료가 없거나 분류·과세 산입액이 미확정입니다. 거래·과세자료에서 보완하세요.")
+    else:
+        st.info(f"등록된 매도·배당·이자 {total}건 중 미등록 과세자료는 발견되지 않았습니다. 다른 기관·계좌의 누락 여부까지 확인된 것은 아닙니다.")
+    st.caption("이 화면은 자료 점검용 요약이며 투자 권유, 세무 신고 결과 또는 금융기관 전체 데이터의 완전성 확인이 아닙니다.")
+    st.info("더 완전한 PB식 진단에는 대출·부채 잔액, 급여·생활비 구분, 재무목표와 위험 선호가 필요합니다. 현재는 이 자료를 수집하거나 저축 여력·투자 적정성을 판단하지 않습니다.")
 
 
 def treatment_choices(account, kind, instrument):
@@ -359,7 +461,8 @@ def main():
         owner = st.sidebar.selectbox("사용자", [*owners, None],
             format_func=lambda p: p.name if p else "새 사용자 등록", key="selected_owner") if owners else None
         accounts = [a for a in all_models(db, Account, "accounts") if owner and a.taxpayer_id == owner.id]
-        route = st.sidebar.radio("메뉴", ["계좌 등록", "보유종목", "현금 잔액", "거래·과세자료", "세금 계산"], key="page")
+        route = st.sidebar.radio("메뉴", ["계좌 등록", "보유종목", "현금 잔액", "거래·과세자료", "세금 계산",
+                                          "사진 거래 가져오기", "자금 진단"], key="page")
         notice = st.session_state.pop("saved_notice", None)
         if notice:
             st.success(notice)
@@ -373,8 +476,12 @@ def main():
             cash_page(db, accounts)
         elif route == "거래·과세자료":
             transaction_page(db, accounts)
-        else:
+        elif route == "세금 계산":
             report_page(db, owner, accounts)
+        elif route == "사진 거래 가져오기":
+            ocr_import_page(db, accounts)
+        else:
+            diagnostics_page(db, owner)
     except (sqlite3.Error, RuntimeError, ValueError) as exc:
         st.error("DB를 열 수 없습니다. 파일 경로와 기존 DB 형식을 확인하세요. " + friendly_error(exc))
     finally:
